@@ -1130,6 +1130,31 @@ Webhook Received -> LLM Call -> HTTP Request
 
 ### 你应该怎么配 `HTTP Request`
 
+- 优先用 `callbackUrl`
+- `Content-Type` 优先用 `text/plain`
+- 直接把 `LLM Call` 的最终文本输出作为整个 body 发回，不要手写 JSON 包装
+
+这样最稳，因为模型回复里常见的换行、制表符和其他控制字符，不会再把最后一步的 JSON 模板弄坏。
+
+如果你在 Lindy 里看到这种报错：
+
+```text
+The request body is not valid JSON: Bad control character in string literal in JSON ...
+```
+
+基本就是最后一步把 LLM 输出直接拼进 JSON body 了。
+
+推荐配置：
+
+- `Method`：`POST`
+- `URL`：`callbackUrl`
+- `Content-Type`：`text/plain`
+- `Body`：`LLM Call` 的最终文本输出
+
+因为 `callbackUrl` 自己已经带了 `jobId`，桥接层会把整个请求体当成最终 `content`。
+
+如果你的 UI 限制必须发 JSON，再退回下面这个方案：
+
 - `Method`：`POST`
 - `URL`：`callbackRequestUrl`
 - `Content-Type`：`application/json`
@@ -1143,6 +1168,9 @@ Webhook Received -> LLM Call -> HTTP Request
 ```
 
 桥接层会根据 `jobId` 找回原始请求，再把 `content` 返回给你的 OpenAI / Anthropic 客户端。
+只有在你确认变量会被正确 JSON 转义时，才建议用这个回退方案。
+
+如果你只能使用固定的 `callbackRequestUrl`，但又想保留 `text/plain`，也可以把 `jobId` 放到查询参数 `?jobId=...`，或者放到请求头 `x-lindy-job-id`。
 
 ### 对你当前这种 UI 限制，推荐工作流
 
@@ -1152,7 +1180,7 @@ Webhook Received -> LLM Call -> HTTP Request
 Webhook Received
 -> 便宜模型 LLM Call（从 body 提取 prompt 和 jobId）
 -> 正式模型 LLM Call（回答问题）
--> HTTP Request（POST 到 callbackRequestUrl）
+-> HTTP Request（优先 POST 到 callbackUrl，`text/plain` 回调）
 ```
 
 ---

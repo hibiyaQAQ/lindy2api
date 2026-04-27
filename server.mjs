@@ -205,8 +205,7 @@ async function handleAnthropic(req, res) {
 }
 
 async function handleCallback(req, res, url) {
-  const hasDynamicPath = url.pathname.startsWith("/__lindy/callback/");
-  let jobId = hasDynamicPath ? url.pathname.split("/").pop() : null;
+  let jobId = getCallbackJobId(req, url);
 
   let payload;
 
@@ -222,7 +221,17 @@ async function handleCallback(req, res, url) {
     }
   }
 
-  payload = await readJson(req);
+  try {
+    payload = await readCallbackPayload(req);
+  } catch (error) {
+    rejectPendingJob(jobId, error);
+    return sendJson(res, 400, {
+      error: {
+        message: error instanceof Error ? error.message : "回调请求体格式不正确",
+        type: "invalid_request_error",
+      },
+    });
+  }
 
   if (!jobId && payload && typeof payload === "object" && typeof payload.jobId === "string") {
     jobId = payload.jobId.trim();
@@ -262,6 +271,36 @@ async function handleCallback(req, res, url) {
   }
 
   return sendJson(res, 200, { ok: true });
+}
+
+function getCallbackJobId(req, url) {
+  const hasDynamicPath = url.pathname.startsWith("/__lindy/callback/");
+  const pathJobId = hasDynamicPath ? url.pathname.split("/").pop() : "";
+  const queryJobId = url.searchParams.get("jobId") ?? "";
+  const headerJobId = readHeaderValue(req.headers["x-lindy-job-id"]);
+
+  for (const candidate of [pathJobId, queryJobId, headerJobId]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
+}
+
+function rejectPendingJob(jobId, error) {
+  if (!jobId || !pendingJobs.has(jobId)) {
+    return;
+  }
+
+  const job = pendingJobs.get(jobId);
+  if (!job) {
+    return;
+  }
+
+  clearTimeout(job.timeoutId);
+  pendingJobs.delete(jobId);
+  job.reject(error instanceof Error ? error : new Error(String(error)));
 }
 
 async function dispatchToLindy(apiFlavor, normalized) {
@@ -572,6 +611,58 @@ function authorizeClient(req) {
 }
 
 async function readJson(req) {
+  const rawText = await readBodyText(req);
+  const text = rawText.trim();
+
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return parseJsonText(text);
+  } catch (error) {
+    throw new Error(`JSON 解析失败: ${error instanceof Error ? error.message : "未知错误"}`);
+  }
+}
+
+async function readCallbackPayload(req) {
+  const rawText = await readBodyText(req);
+  const text = rawText.trim();
+  const contentType = readHeaderValue(req.headers["content-type"]).toLowerCase();
+  const bodyLooksLikeJson = looksLikeJsonPayload(text);
+
+  if (!text) {
+    return {};
+  }
+
+  if (isTextContentType(contentType)) {
+    return rawText;
+  }
+
+  if (isJsonContentType(contentType)) {
+    try {
+      return parseJsonText(text);
+    } catch (error) {
+      if (!bodyLooksLikeJson) {
+        return rawText;
+      }
+
+      throw new Error(`回调请求体解析失败: ${error instanceof Error ? error.message : "未知错误"}`);
+    }
+  }
+
+  if (bodyLooksLikeJson) {
+    try {
+      return parseJsonText(text);
+    } catch {
+      return rawText;
+    }
+  }
+
+  return rawText;
+}
+
+async function readBodyText(req) {
   const chunks = [];
   let size = 0;
 
@@ -583,17 +674,110 @@ async function readJson(req) {
     chunks.push(chunk);
   }
 
-  const text = Buffer.concat(chunks).toString("utf8").trim();
+  return Buffer.concat(chunks).toString("utf8");
+}
 
-  if (!text) {
-    return {};
-  }
-
+function parseJsonText(text) {
   try {
     return JSON.parse(text);
   } catch (error) {
-    throw new Error(`JSON 解析失败: ${error instanceof Error ? error.message : "未知错误"}`);
+    const sanitizedText = sanitizeJsonControlCharacters(text);
+
+    if (sanitizedText !== text) {
+      return JSON.parse(sanitizedText);
+    }
+
+    throw error;
   }
+}
+
+function sanitizeJsonControlCharacters(text) {
+  let result = "";
+  let inString = false;
+  let isEscaping = false;
+  let changed = false;
+
+  for (const char of text) {
+    if (inString) {
+      if (isEscaping) {
+        result += char;
+        isEscaping = false;
+        continue;
+      }
+
+      if (char === "\\") {
+        result += char;
+        isEscaping = true;
+        continue;
+      }
+
+      if (char === "\"") {
+        result += char;
+        inString = false;
+        continue;
+      }
+
+      const escapedChar = toEscapedControlCharacter(char);
+      if (escapedChar) {
+        result += escapedChar;
+        changed = true;
+        continue;
+      }
+
+      result += char;
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+    }
+
+    result += char;
+  }
+
+  return changed ? result : text;
+}
+
+function toEscapedControlCharacter(char) {
+  switch (char) {
+    case "\b":
+      return "\\b";
+    case "\f":
+      return "\\f";
+    case "\n":
+      return "\\n";
+    case "\r":
+      return "\\r";
+    case "\t":
+      return "\\t";
+    default: {
+      const codePoint = char.codePointAt(0) ?? 0;
+      if (codePoint < 0x20) {
+        return `\\u${codePoint.toString(16).padStart(4, "0")}`;
+      }
+      return "";
+    }
+  }
+}
+
+function looksLikeJsonPayload(text) {
+  return text.startsWith("{") || text.startsWith("[") || text.startsWith("\"");
+}
+
+function isJsonContentType(contentType) {
+  return contentType.includes("application/json") || contentType.includes("+json");
+}
+
+function isTextContentType(contentType) {
+  return contentType.startsWith("text/");
+}
+
+function readHeaderValue(value) {
+  if (Array.isArray(value)) {
+    return String(value[0] ?? "");
+  }
+
+  return typeof value === "string" ? value : "";
 }
 
 function sendJson(res, statusCode, payload, headers = {}) {
@@ -669,6 +853,7 @@ function classifyErrorStatus(error) {
 
   if (
     message.includes("调用 Lindy webhook 失败") ||
+    message.includes("回调请求体解析失败") ||
     message.includes("Lindy 回调") ||
     message.includes("fetch failed")
   ) {

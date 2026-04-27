@@ -144,21 +144,23 @@
 
 使用 webhook 请求体里的 `callbackUrl`。
 
-如果你改用 `HTTP Request`，则优先使用 `callbackRequestUrl`。
+如果你改用 `HTTP Request`，推荐优先直接使用 `callbackUrl`，并把请求体作为纯文本发回。
+
+这样最稳，因为模型输出里常见的换行、制表符或其他控制字符，不会再被硬塞进 JSON 字符串里。
+
+如果你看到类似下面的报错：
+
+```text
+The request body is not valid JSON: Bad control character in string literal in JSON ...
+```
+
+通常就是最后一步把 LLM 输出直接拼进 JSON body 了。
 
 ### Body
 
-建议直接返回最小 JSON：
+推荐直接把 `LLM Call` 的最终文本输出原样作为请求体发回，不要再手写 JSON 包装。
 
-```json
-{
-  "content": "这里放 LLM 最终文本"
-}
-```
-
-这里的 `"这里放 LLM 最终文本"` 应该通过 Lindy 变量选择器，从 `LLM Call` 这一步的输出变量里选取。
-
-文档只明确说 `LLM Call` 的输出是 `AI Response`，但没有在导出文本里把最终模板变量名固定写死，所以这里同样建议：
+文档只明确说 `LLM Call` 的输出是 `AI Response`，但没有在导出文本里把最终模板变量名固定写死，所以这里建议：
 
 - 不要凭空手写变量名
 - 直接在动作里点击 `LLM Call` 的输出变量
@@ -178,7 +180,16 @@ Lindy webhook 请求体里会多给你两个字段：
 }
 ```
 
-这时 `HTTP Request` 建议这样配：
+最稳的 `HTTP Request` 配置是：
+
+- `Method`：`POST`
+- `URL`：`callbackUrl`
+- `Content-Type`：`text/plain`
+- `Body`：直接放 `LLM Call` 的最终文本输出
+
+因为 `callbackUrl` 自身已经带了 `jobId`，桥接层会把整个请求体当成最终 `content`。
+
+如果你的 UI 限制必须发 `application/json`，再退回下面这个方案：
 
 - `Method`：`POST`
 - `URL`：`callbackRequestUrl`
@@ -192,7 +203,9 @@ Lindy webhook 请求体里会多给你两个字段：
 }
 ```
 
-桥接层会根据 `jobId` 关联回原始请求。
+只有在你确认变量会被正确 JSON 转义时，才建议用这个方案。
+
+如果你只能使用固定的 `callbackRequestUrl`，但又想保留 `text/plain`，也可以把 `jobId` 放到查询参数 `?jobId=...`，或者放到请求头 `x-lindy-job-id`。
 
 ## 第 5 步：推荐回调格式
 
