@@ -1,0 +1,15 @@
+{
+  "name": "lindy2api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "将 Lindy webhook 封装成 OpenAI / Anthropic 兼容接口的最小桥接服务",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs",
+    "smoke": "node scripts/smoke-test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
