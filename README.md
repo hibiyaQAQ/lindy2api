@@ -1172,9 +1172,79 @@ The request body is not valid JSON: Bad control character in string literal in J
 
 如果你只能使用固定的 `callbackRequestUrl`，但又想保留 `text/plain`，也可以把 `jobId` 放到查询参数 `?jobId=...`，或者放到请求头 `x-lindy-job-id`。
 
+### 如果你拿不到 `body.system` / `body.prompt`
+
+桥接层现在额外提供了一个辅助 endpoint：
+
+```text
+POST /__lindy/prepare?token=你的 LINDY_CALLBACK_TOKEN
+```
+
+它会把 Lindy 手里的原始 webhook body 再整理一遍，返回更适合后续节点直接绑定的字段：
+
+```json
+{
+  "system": "字符串形式的 system",
+  "prompt": "字符串形式的 prompt",
+  "lastUserMessage": "最后一条用户消息",
+  "jobId": "uuid",
+  "callbackUrl": "https://your-bridge.example.com/__lindy/callback/uuid?token=xxx",
+  "callbackRequestUrl": "https://your-bridge.example.com/__lindy/callback?token=xxx",
+  "bodyText": "{ ...原始 body 的字符串化结果... }"
+}
+```
+
+如果你的 Lindy 只能把 HTTP 响应当成一整个 `output`，不能继续按 JSON 字段展开，就不要让它拿整份 JSON，而是直接请求单个字段：
+
+```text
+POST /__lindy/prepare?token=你的 LINDY_CALLBACK_TOKEN&field=system
+POST /__lindy/prepare?token=你的 LINDY_CALLBACK_TOKEN&field=prompt
+POST /__lindy/prepare?token=你的 LINDY_CALLBACK_TOKEN&field=jobId
+POST /__lindy/prepare?token=你的 LINDY_CALLBACK_TOKEN&field=callbackUrl
+```
+
+这些请求会直接返回纯文本，所以每个 HTTP Request 节点的整个 output，就正好是你要的值。
+
+推荐链路：
+
+```text
+Webhook Received
+-> HTTP Request（POST 到 /__lindy/prepare）
+-> LLM Call（直接绑定 prepare 返回的 system / prompt）
+-> HTTP Request（回调 callbackUrl 或 callbackRequestUrl）
+```
+
+`/__lindy/prepare` 支持三种输入：
+
+- 直接把整个 webhook body 作为 `application/json` 发过去
+- 用 JSON 包一层，例如 `{ "body": <原始 body> }`
+- 如果你只能拿到原始 JSON 字符串，就用 `text/plain` 发过去
+
+如果原始 body 里已经有 `prompt` / `system`，它会直接返回；如果只有 `messages`，它也会自动重建 prompt。
+
 ### 对你当前这种 UI 限制，推荐工作流
 
 如果你拿不到展开后的 `body.prompt` / `body.jobId`，又没有 callback skill，推荐这样配：
+
+```text
+Webhook Received
+-> HTTP Request（field=system）
+-> HTTP Request（field=prompt）
+-> HTTP Request（field=jobId）
+-> LLM Call（System Prompt 用 system 节点输出，User Prompt 用 prompt 节点输出）
+-> HTTP Request（固定 callback URL，header 里带 x-lindy-job-id，body 放最终文本）
+```
+
+如果你能正常消费前一步 HTTP 返回的 JSON 字段，也可以走更少节点的版本：
+
+```text
+Webhook Received
+-> HTTP Request（POST 到 /__lindy/prepare）
+-> 正式模型 LLM Call（直接用 prepare 的 system / prompt）
+-> HTTP Request（优先 POST 到 callbackUrl，`text/plain` 回调）
+```
+
+如果你不方便加这个辅助 HTTP Request，再退回旧方案：
 
 ```text
 Webhook Received

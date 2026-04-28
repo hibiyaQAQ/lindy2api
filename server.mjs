@@ -39,6 +39,10 @@ const server = createServer(async (req, res) => {
       return await handleAnthropic(req, res);
     }
 
+    if (req.method === "POST" && url.pathname === "/__lindy/prepare") {
+      return await handleLindyPrepare(req, res, url);
+    }
+
     if (
       req.method === "POST" &&
       (url.pathname === "/__lindy/callback" || url.pathname.startsWith("/__lindy/callback/"))
@@ -273,6 +277,50 @@ async function handleCallback(req, res, url) {
   return sendJson(res, 200, { ok: true });
 }
 
+async function handleLindyPrepare(req, res, url) {
+  try {
+    if (!authorizeInternalRequest(req, url)) {
+      return sendJson(res, 401, {
+        error: {
+          message: "未授权",
+          type: "authentication_error",
+        },
+      });
+    }
+
+    const payload = await readPreparePayload(req);
+    const prepared = buildLindyPrepareResponse(payload);
+    const field = url.searchParams.get("field")?.trim() || "";
+
+    if (field) {
+      return sendPreparedField(res, prepared, field);
+    }
+
+    return sendJson(res, 200, prepared);
+  } catch (error) {
+    const statusCode = classifyErrorStatus(error);
+    return sendJson(res, statusCode, {
+      error: {
+        message: error instanceof Error ? error.message : "未知错误",
+        type: statusCode >= 500 ? "api_error" : "invalid_request_error",
+      },
+    });
+  }
+}
+
+function sendPreparedField(res, prepared, field) {
+  if (!Object.prototype.hasOwnProperty.call(prepared, field)) {
+    return sendJson(res, 400, {
+      error: {
+        message: `不支持的 prepare 字段: ${field}`,
+        type: "invalid_request_error",
+      },
+    });
+  }
+
+  return sendText(res, 200, stringifyField(prepared[field]));
+}
+
 function getCallbackJobId(req, url) {
   const hasDynamicPath = url.pathname.startsWith("/__lindy/callback/");
   const pathJobId = hasDynamicPath ? url.pathname.split("/").pop() : "";
@@ -301,6 +349,166 @@ function rejectPendingJob(jobId, error) {
   clearTimeout(job.timeoutId);
   pendingJobs.delete(jobId);
   job.reject(error instanceof Error ? error : new Error(String(error)));
+}
+
+function authorizeInternalRequest(req, url) {
+  if (authorizeClient(req)) {
+    return true;
+  }
+
+  if (config.callbackToken) {
+    const token = url.searchParams.get("token");
+    if (token === config.callbackToken) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function buildLindyPrepareResponse(payload) {
+  const { body, source } = unwrapLindyPrepareBody(payload);
+  const prepared = buildPreparedPromptContext(body);
+
+  return {
+    source,
+    bodyText: JSON.stringify(body, null, 2),
+    ...prepared,
+  };
+}
+
+function unwrapLindyPrepareBody(payload) {
+  const resolvedPayload = parsePossibleJsonValue(payload);
+
+  if (resolvedPayload && typeof resolvedPayload === "object" && !Array.isArray(resolvedPayload)) {
+    const candidates = [
+      ["request.body", resolvedPayload.request?.body],
+      ["body", resolvedPayload.body],
+      ["webhook_received.request.body", resolvedPayload.webhook_received?.request?.body],
+      ["webhookReceived.request.body", resolvedPayload.webhookReceived?.request?.body],
+      ["input.body", resolvedPayload.input?.body],
+    ];
+
+    for (const [source, candidate] of candidates) {
+      if (candidate == null) {
+        continue;
+      }
+
+      const resolvedCandidate = parsePossibleJsonValue(candidate);
+      if (resolvedCandidate && typeof resolvedCandidate === "object" && !Array.isArray(resolvedCandidate)) {
+        return {
+          body: resolvedCandidate,
+          source,
+        };
+      }
+
+      if (typeof resolvedCandidate === "string" && resolvedCandidate.trim()) {
+        return {
+          body: {
+            rawBody: resolvedCandidate,
+          },
+          source,
+        };
+      }
+    }
+
+    return {
+      body: resolvedPayload,
+      source: "direct",
+    };
+  }
+
+  if (typeof resolvedPayload === "string" && resolvedPayload.trim()) {
+    return {
+      body: {
+        rawBody: resolvedPayload,
+      },
+      source: "direct",
+    };
+  }
+
+  return {
+    body: {},
+    source: "direct",
+  };
+}
+
+function buildPreparedPromptContext(body) {
+  const reconstructed = reconstructPromptContext(body);
+  const system = safeExtractText(body.system) || reconstructed.system;
+
+  return {
+    jobId: stringifyField(body.jobId),
+    requestId: stringifyField(body.requestId),
+    callbackUrl: stringifyField(body.callbackUrl),
+    callbackRequestUrl: stringifyField(body.callbackRequestUrl),
+    requestedModel: stringifyField(body.requestedModel || body.model),
+    system,
+    prompt: safeExtractText(body.prompt) || reconstructed.prompt,
+    lastUserMessage: safeExtractText(body.lastUserMessage) || reconstructed.lastUserMessage,
+    temperature: numberOrNull(body.temperature),
+    maxTokens: numberOrNull(body.maxTokens ?? body.max_tokens),
+    reconstructedSystem: reconstructed.system,
+  };
+}
+
+function reconstructPromptContext(body) {
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return {
+      system: "",
+      prompt: "",
+      lastUserMessage: "",
+    };
+  }
+
+  const normalizedMessages = normalizeMessages(body.messages);
+  const explicitSystem = safeExtractText(body.system);
+
+  if (explicitSystem) {
+    return {
+      system: explicitSystem,
+      prompt: buildPrompt(explicitSystem, normalizedMessages),
+      lastUserMessage: findLastMessage(normalizedMessages, "user"),
+    };
+  }
+
+  const systemMessages = normalizedMessages.filter((item) => item.role === "system");
+  const nonSystemMessages = normalizedMessages.filter((item) => item.role !== "system");
+  const system = systemMessages.map((item) => item.text).join("\n\n");
+
+  return {
+    system,
+    prompt: buildPrompt(system, nonSystemMessages),
+    lastUserMessage: findLastMessage(nonSystemMessages, "user"),
+  };
+}
+
+function safeExtractText(value) {
+  if (value == null) {
+    return "";
+  }
+
+  try {
+    return extractContentText(value);
+  } catch {
+    return stringifyField(value);
+  }
+}
+
+function stringifyField(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (value == null) {
+    return "";
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  return JSON.stringify(value, null, 2);
 }
 
 async function dispatchToLindy(apiFlavor, normalized) {
@@ -625,6 +833,22 @@ async function readJson(req) {
   }
 }
 
+async function readPreparePayload(req) {
+  const rawText = await readBodyText(req);
+  const text = rawText.trim();
+  const contentType = readHeaderValue(req.headers["content-type"]).toLowerCase();
+
+  if (!text) {
+    return {};
+  }
+
+  if (isJsonContentType(contentType)) {
+    return parseJsonText(text);
+  }
+
+  return parsePossibleJsonValue(rawText);
+}
+
 async function readCallbackPayload(req) {
   const rawText = await readBodyText(req);
   const text = rawText.trim();
@@ -688,6 +912,23 @@ function parseJsonText(text) {
     }
 
     throw error;
+  }
+}
+
+function parsePossibleJsonValue(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  const text = value.trim();
+  if (!text || !looksLikeJsonPayload(text)) {
+    return value;
+  }
+
+  try {
+    return parseJsonText(text);
+  } catch {
+    return value;
   }
 }
 
@@ -786,6 +1027,14 @@ function sendJson(res, statusCode, payload, headers = {}) {
     ...headers,
   });
   res.end(JSON.stringify(payload, null, 2));
+}
+
+function sendText(res, statusCode, text, headers = {}) {
+  res.writeHead(statusCode, {
+    "content-type": "text/plain; charset=utf-8",
+    ...headers,
+  });
+  res.end(text);
 }
 
 function sendOpenAIError(res, statusCode, message) {

@@ -61,11 +61,13 @@ try {
   process.env.PUBLIC_BASE_URL = `http://127.0.0.1:${BRIDGE_PORT}`;
   process.env.LINDY_WEBHOOK_URL = `http://127.0.0.1:${MOCK_PORT}/mock`;
   process.env.LINDY_WEBHOOK_SECRET = "smoke-secret";
+  process.env.LINDY_CALLBACK_TOKEN = "smoke-callback-token";
 
   await listen(mockServer, MOCK_PORT);
   await startBridgeServer();
   await waitForHealthz();
 
+  await assertLindyPrepareEndpoint();
   await assertOpenAICompletion("请返回标准回调", "桥接验证成功");
   await assertOpenAICompletion("请返回纯文本回调", "纯文本回调第一行\n第二行\t保留");
   await assertOpenAICompletion("请返回损坏 JSON 回调", "损坏 JSON 第一行\n第二行\t保留");
@@ -103,6 +105,90 @@ async function assertOpenAICompletion(userMessage, expectedText) {
 
   if (text !== expectedText) {
     throw new Error(`桥接返回内容不符合预期: ${JSON.stringify(json)}`);
+  }
+}
+
+async function assertLindyPrepareEndpoint() {
+  const prepareUrl = `http://127.0.0.1:${BRIDGE_PORT}/__lindy/prepare?token=${process.env.LINDY_CALLBACK_TOKEN}`;
+
+  const directResponse = await fetch(prepareUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      body: {
+        jobId: "job-1",
+        callbackUrl: "https://example.com/callback",
+        callbackRequestUrl: "https://example.com/callback-static",
+        system: "你是测试助手",
+        prompt: "请直接回答：你好",
+        lastUserMessage: "你好",
+      },
+    }),
+  });
+
+  if (!directResponse.ok) {
+    throw new Error(`prepare 接口请求失败: ${directResponse.status} ${await directResponse.text()}`);
+  }
+
+  const directJson = await directResponse.json();
+  if (
+    directJson.jobId !== "job-1" ||
+    directJson.system !== "你是测试助手" ||
+    directJson.prompt !== "请直接回答：你好" ||
+    directJson.source !== "body"
+  ) {
+    throw new Error(`prepare 接口返回内容不符合预期: ${JSON.stringify(directJson)}`);
+  }
+
+  const rawJsonResponse = await fetch(prepareUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+    },
+    body: JSON.stringify({
+      messages: [
+        { role: "system", content: "你是系统提示" },
+        { role: "user", content: "你好" },
+      ],
+    }),
+  });
+
+  if (!rawJsonResponse.ok) {
+    throw new Error(`prepare 文本请求失败: ${rawJsonResponse.status} ${await rawJsonResponse.text()}`);
+  }
+
+  const rawJson = await rawJsonResponse.json();
+  if (
+    rawJson.system !== "你是系统提示" ||
+    rawJson.lastUserMessage !== "你好" ||
+    !rawJson.prompt.includes("系统指令：\n你是系统提示") ||
+    !rawJson.prompt.includes("user：\n你好")
+  ) {
+    throw new Error(`prepare 文本返回内容不符合预期: ${JSON.stringify(rawJson)}`);
+  }
+
+  const fieldResponse = await fetch(`${prepareUrl}&field=prompt`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      body: {
+        system: "你是测试助手",
+        prompt: "请直接回答：你好",
+      },
+    }),
+  });
+
+  if (!fieldResponse.ok) {
+    throw new Error(`prepare 字段请求失败: ${fieldResponse.status} ${await fieldResponse.text()}`);
+  }
+
+  const fieldText = await fieldResponse.text();
+  if (fieldText !== "请直接回答：你好") {
+    throw new Error(`prepare 字段返回内容不符合预期: ${JSON.stringify(fieldText)}`);
   }
 }
 
