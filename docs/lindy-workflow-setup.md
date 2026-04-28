@@ -32,7 +32,7 @@
     { "role": "user", "text": "你好" },
     { "role": "assistant", "text": "你好，请说。" }
   ],
-  "prompt": "桥接层整理好的完整对话文本",
+  "prompt": "桥接层整理好的完整对话文本（不含 system）",
   "lastUserMessage": "最后一条用户消息",
   "temperature": 0.2,
   "maxTokens": 512,
@@ -118,7 +118,7 @@
 
 直接使用 webhook 请求里的 `prompt`。
 
-桥接层已经把完整历史整理成了一段文本，所以这里不需要你再自己拼消息。
+桥接层已经把完整历史整理成了一段文本，而且默认不再重复包含 `system`，所以这里不需要你再自己拼消息。
 
 #### Temperature / Max Output Tokens
 
@@ -220,7 +220,7 @@ POST /__lindy/prepare?token=你的 LINDY_CALLBACK_TOKEN
 ```json
 {
   "system": "字符串形式的 system",
-  "prompt": "字符串形式的 prompt",
+  "prompt": "字符串形式的 prompt（不含 system）",
   "lastUserMessage": "最后一条用户消息",
   "jobId": "uuid",
   "callbackUrl": "https://your-bridge.example.com/__lindy/callback/uuid?token=xxx",
@@ -256,6 +256,11 @@ Webhook Received
 - 如果你只能拿到原始 JSON 字符串，就用 `text/plain` 发过去
 
 如果原始 body 里已经有 `prompt` / `system`，它会直接返回；如果只有 `messages`，它也会自动重建 prompt。
+
+默认建议你在 `LLM Call` 里使用：
+
+- `System Prompt` -> `system`
+- `User Prompt` -> `prompt`
 
 如果你当前 UI 不能消费 HTTP 返回的 JSON 字段，推荐直接拆成多个节点：
 

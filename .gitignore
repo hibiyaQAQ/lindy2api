@@ -1,3 +1,5 @@
 .env
 .env.local
+bridge.config.json
+bridge.config.smoke.json
 node_modules

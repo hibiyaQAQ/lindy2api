@@ -1,10 +1,13 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const DEFAULT_MANAGED_CONFIG_PATH = "bridge.config.json";
+const ADMIN_UI_PATH = "/__admin";
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const pendingJobs = new Map();
 
 let config;
@@ -29,6 +32,14 @@ const server = createServer(async (req, res) => {
           owned_by: "lindy-bridge",
         })),
       });
+    }
+
+    if (req.method === "GET" && (url.pathname === ADMIN_UI_PATH || url.pathname === `${ADMIN_UI_PATH}/`)) {
+      return sendAdminUi(res);
+    }
+
+    if (url.pathname === `${ADMIN_UI_PATH}/api/config`) {
+      return await handleAdminConfig(req, res, url);
     }
 
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
@@ -121,10 +132,7 @@ async function handleOpenAI(req, res) {
     }
 
     const body = await readJson(req);
-
-    if (body.stream === true) {
-      return sendOpenAIError(res, 400, "当前桥接层不支持 stream=true");
-    }
+    const wantsStream = body.stream === true;
 
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       return sendOpenAIError(res, 400, "`messages` 必须是非空数组");
@@ -133,27 +141,13 @@ async function handleOpenAI(req, res) {
     const normalized = normalizeOpenAIRequest(body);
     const job = await dispatchToLindy("openai", normalized);
     const callbackPayload = await waitForCallback(job);
-    const assistantText = extractAssistantText(callbackPayload);
+    const completion = buildOpenAIResponse(job.id, normalized.requestedModel, callbackPayload);
 
-    return sendJson(res, 200, {
-      id: `chatcmpl_${job.id}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: normalized.requestedModel,
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: "assistant",
-            content: assistantText,
-          },
-          finish_reason: "stop",
-        },
-      ],
-      ...(extractOpenAIUsage(callbackPayload)
-        ? { usage: extractOpenAIUsage(callbackPayload) }
-        : {}),
-    });
+    if (wantsStream) {
+      return sendOpenAIStreamResponse(res, completion, body.stream_options);
+    }
+
+    return sendJson(res, 200, completion);
   } catch (error) {
     return sendOpenAIError(
       res,
@@ -170,10 +164,7 @@ async function handleAnthropic(req, res) {
     }
 
     const body = await readJson(req);
-
-    if (body.stream === true) {
-      return sendAnthropicError(res, 400, "当前桥接层不支持 stream=true");
-    }
+    const wantsStream = body.stream === true;
 
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       return sendAnthropicError(res, 400, "`messages` 必须是非空数组");
@@ -182,23 +173,13 @@ async function handleAnthropic(req, res) {
     const normalized = normalizeAnthropicRequest(body);
     const job = await dispatchToLindy("anthropic", normalized);
     const callbackPayload = await waitForCallback(job);
-    const assistantText = extractAssistantText(callbackPayload);
+    const message = buildAnthropicResponse(job.id, normalized.requestedModel, callbackPayload);
 
-    return sendJson(res, 200, {
-      id: `msg_${job.id}`,
-      type: "message",
-      role: "assistant",
-      model: normalized.requestedModel,
-      content: [
-        {
-          type: "text",
-          text: assistantText,
-        },
-      ],
-      stop_reason: "end_turn",
-      stop_sequence: null,
-      usage: extractAnthropicUsage(callbackPayload),
-    });
+    if (wantsStream) {
+      return sendAnthropicStreamResponse(res, message);
+    }
+
+    return sendJson(res, 200, message);
   } catch (error) {
     return sendAnthropicError(
       res,
@@ -206,6 +187,95 @@ async function handleAnthropic(req, res) {
       error instanceof Error ? error.message : "未知错误",
     );
   }
+}
+
+function buildOpenAIResponse(jobId, model, callbackPayload) {
+  const assistantText = extractAssistantText(callbackPayload);
+  const usage = extractOpenAIUsage(callbackPayload);
+
+  return {
+    id: `chatcmpl_${jobId}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: assistantText,
+        },
+        finish_reason: "stop",
+      },
+    ],
+    ...(usage ? { usage } : {}),
+  };
+}
+
+function buildAnthropicResponse(jobId, model, callbackPayload) {
+  const assistantText = extractAssistantText(callbackPayload);
+
+  return {
+    id: `msg_${jobId}`,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [
+      {
+        type: "text",
+        text: assistantText,
+      },
+    ],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: extractAnthropicUsage(callbackPayload),
+  };
+}
+
+async function handleAdminConfig(req, res, url) {
+  const authorization = getAdminAuthorization(req, url);
+
+  if (!authorization.ok) {
+    return sendJson(res, authorization.statusCode, {
+      error: {
+        message: authorization.message,
+        type: authorization.statusCode === 401 ? "authentication_error" : "permission_error",
+      },
+    });
+  }
+
+  if (req.method === "GET") {
+    return sendJson(res, 200, buildAdminConfigResponse());
+  }
+
+  if (req.method === "PUT") {
+    try {
+      const payload = await readJson(req);
+      const managedConfig = normalizeManagedConfigInput(payload);
+
+      writeManagedConfigFile(config.admin.configPath, managedConfig);
+      config = mergeManagedConfig(loadBaseConfig(), managedConfig);
+
+      return sendJson(res, 200, {
+        ok: true,
+        ...buildAdminConfigResponse(),
+      });
+    } catch (error) {
+      return sendJson(res, classifyErrorStatus(error), {
+        error: {
+          message: error instanceof Error ? error.message : "未知错误",
+          type: "invalid_request_error",
+        },
+      });
+    }
+  }
+
+  return sendJson(res, 405, {
+    error: {
+      message: `管理接口不支持 ${req.method} 方法`,
+      type: "invalid_request_error",
+    },
+  });
 }
 
 async function handleCallback(req, res, url) {
@@ -463,22 +533,22 @@ function reconstructPromptContext(body) {
 
   const normalizedMessages = normalizeMessages(body.messages);
   const explicitSystem = safeExtractText(body.system);
+  const nonSystemMessages = normalizedMessages.filter((item) => item.role !== "system");
 
   if (explicitSystem) {
     return {
       system: explicitSystem,
-      prompt: buildPrompt(explicitSystem, normalizedMessages),
-      lastUserMessage: findLastMessage(normalizedMessages, "user"),
+      prompt: buildPrompt(nonSystemMessages),
+      lastUserMessage: findLastMessage(nonSystemMessages, "user"),
     };
   }
 
   const systemMessages = normalizedMessages.filter((item) => item.role === "system");
-  const nonSystemMessages = normalizedMessages.filter((item) => item.role !== "system");
   const system = systemMessages.map((item) => item.text).join("\n\n");
 
   return {
     system,
-    prompt: buildPrompt(system, nonSystemMessages),
+    prompt: buildPrompt(nonSystemMessages),
     lastUserMessage: findLastMessage(nonSystemMessages, "user"),
   };
 }
@@ -585,7 +655,7 @@ function normalizeOpenAIRequest(body) {
     requestedModel: coerceModel(body.model),
     system,
     messages: nonSystemMessages,
-    prompt: buildPrompt(system, nonSystemMessages),
+    prompt: buildPrompt(nonSystemMessages),
     lastUserMessage: findLastMessage(nonSystemMessages, "user"),
     temperature: numberOrNull(body.temperature),
     maxTokens: numberOrNull(body.max_completion_tokens ?? body.max_tokens),
@@ -596,15 +666,18 @@ function normalizeOpenAIRequest(body) {
 }
 
 function normalizeAnthropicRequest(body) {
-  const system = extractContentText(body.system ?? "");
+  const explicitSystem = extractContentText(body.system ?? "");
   const messages = normalizeMessages(body.messages);
+  const systemMessages = messages.filter((item) => item.role === "system");
+  const nonSystemMessages = messages.filter((item) => item.role !== "system");
+  const system = [explicitSystem, ...systemMessages.map((item) => item.text)].filter(Boolean).join("\n\n");
 
   return {
     requestedModel: coerceModel(body.model),
     system,
-    messages,
-    prompt: buildPrompt(system, messages),
-    lastUserMessage: findLastMessage(messages, "user"),
+    messages: nonSystemMessages,
+    prompt: buildPrompt(nonSystemMessages),
+    lastUserMessage: findLastMessage(nonSystemMessages, "user"),
     temperature: numberOrNull(body.temperature),
     maxTokens: numberOrNull(body.max_tokens),
     metadata: {
@@ -680,12 +753,8 @@ function extractContentText(content) {
   throw new Error("消息 content 只支持字符串或文本数组");
 }
 
-function buildPrompt(system, messages) {
+function buildPrompt(messages) {
   const parts = [];
-
-  if (system) {
-    parts.push(`系统指令：\n${system}`);
-  }
 
   parts.push("下面是完整对话历史，请基于全部上下文回复最后一条用户消息。");
 
@@ -816,6 +885,70 @@ function authorizeClient(req) {
   }
 
   return false;
+}
+
+function getAdminAuthorization(req, url) {
+  if (config.admin.token) {
+    const providedToken = readAdminToken(req, url);
+    if (providedToken === config.admin.token) {
+      return { ok: true };
+    }
+
+    return {
+      ok: false,
+      statusCode: 401,
+      message: "管理接口未授权，请提供 ADMIN_TOKEN 或当前 BRIDGE_API_KEY。",
+    };
+  }
+
+  if (isLoopbackRequest(req)) {
+    return { ok: true };
+  }
+
+  return {
+    ok: false,
+    statusCode: 403,
+    message: "未配置 ADMIN_TOKEN 或 BRIDGE_API_KEY 时，只允许本机访问管理接口。",
+  };
+}
+
+function readAdminToken(req, url) {
+  const authHeader = readHeaderValue(req.headers.authorization);
+  if (authHeader.startsWith("Bearer ")) {
+    return authHeader.slice("Bearer ".length).trim();
+  }
+
+  const headerToken = readHeaderValue(req.headers["x-admin-token"]).trim();
+  if (headerToken) {
+    return headerToken;
+  }
+
+  return url.searchParams.get("token")?.trim() || "";
+}
+
+function isLoopbackRequest(req) {
+  const remoteAddress = req.socket?.remoteAddress ?? "";
+  return remoteAddress === "127.0.0.1" || remoteAddress === "::1" || remoteAddress === "::ffff:127.0.0.1";
+}
+
+function buildAdminConfigResponse() {
+  return {
+    config: {
+      publicBaseUrl: config.publicBaseUrl,
+      bridgeApiKey: config.bridgeApiKey,
+      callbackToken: config.callbackToken,
+      requestTimeoutMs: config.requestTimeoutMs,
+      adminToken: config.admin.explicitToken,
+      routes: routesToArray(config.routes),
+    },
+    runtime: {
+      port: config.port,
+      configPath: config.admin.configPath,
+      managedConfigExists: config.admin.managedConfigExists,
+      adminAuthSource: config.admin.authSource,
+      models: listModels(config.routes),
+    },
+  };
 }
 
 async function readJson(req) {
@@ -1037,6 +1170,210 @@ function sendText(res, statusCode, text, headers = {}) {
   res.end(text);
 }
 
+function sendHtml(res, statusCode, html, headers = {}) {
+  res.writeHead(statusCode, {
+    "content-type": "text/html; charset=utf-8",
+    ...headers,
+  });
+  res.end(html);
+}
+
+function sendAdminUi(res) {
+  const html = readFileSync(join(MODULE_DIR, "public", "admin.html"), "utf8");
+  return sendHtml(res, 200, html, {
+    "cache-control": "no-store",
+  });
+}
+
+function sendOpenAIStreamResponse(res, completion, streamOptions) {
+  const includeUsage =
+    streamOptions &&
+    typeof streamOptions === "object" &&
+    streamOptions.include_usage === true;
+  const content = completion.choices[0]?.message?.content ?? "";
+  const chunks = [
+    {
+      data: {
+        id: completion.id,
+        object: "chat.completion.chunk",
+        created: completion.created,
+        model: completion.model,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+            },
+            finish_reason: null,
+          },
+        ],
+      },
+    },
+    {
+      data: {
+        id: completion.id,
+        object: "chat.completion.chunk",
+        created: completion.created,
+        model: completion.model,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              content,
+            },
+            finish_reason: null,
+          },
+        ],
+      },
+    },
+    {
+      data: {
+        id: completion.id,
+        object: "chat.completion.chunk",
+        created: completion.created,
+        model: completion.model,
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: "stop",
+          },
+        ],
+      },
+    },
+  ];
+
+  if (includeUsage && completion.usage) {
+    chunks.push({
+      data: {
+        id: completion.id,
+        object: "chat.completion.chunk",
+        created: completion.created,
+        model: completion.model,
+        choices: [],
+        usage: completion.usage,
+      },
+    });
+  }
+
+  chunks.push({
+    data: "[DONE]",
+  });
+
+  return sendEventStream(res, chunks);
+}
+
+function sendAnthropicStreamResponse(res, message) {
+  const textBlock = message.content.find((block) => block.type === "text");
+  const text = textBlock?.text ?? "";
+  const usage = message.usage ?? {
+    input_tokens: 0,
+    output_tokens: 0,
+  };
+
+  return sendEventStream(
+    res,
+    [
+      {
+        event: "message_start",
+        data: {
+          type: "message_start",
+          message: {
+            id: message.id,
+            type: "message",
+            role: message.role,
+            model: message.model,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: {
+              input_tokens: usage.input_tokens,
+              output_tokens: 0,
+            },
+          },
+        },
+      },
+      {
+        event: "content_block_start",
+        data: {
+          type: "content_block_start",
+          index: 0,
+          content_block: {
+            type: "text",
+            text: "",
+          },
+        },
+      },
+      {
+        event: "content_block_delta",
+        data: {
+          type: "content_block_delta",
+          index: 0,
+          delta: {
+            type: "text_delta",
+            text,
+          },
+        },
+      },
+      {
+        event: "content_block_stop",
+        data: {
+          type: "content_block_stop",
+          index: 0,
+        },
+      },
+      {
+        event: "message_delta",
+        data: {
+          type: "message_delta",
+          delta: {
+            stop_reason: message.stop_reason,
+            stop_sequence: message.stop_sequence,
+          },
+          usage: {
+            output_tokens: usage.output_tokens,
+          },
+        },
+      },
+      {
+        event: "message_stop",
+        data: {
+          type: "message_stop",
+        },
+      },
+    ],
+    {
+      "anthropic-version": "2023-06-01",
+    },
+  );
+}
+
+function sendEventStream(res, events, headers = {}) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+    ...headers,
+  });
+  res.end(events.map(formatSseEvent).join(""));
+}
+
+function formatSseEvent(event) {
+  const lines = [];
+
+  if (event.event) {
+    lines.push(`event: ${event.event}`);
+  }
+
+  const payload = typeof event.data === "string" ? event.data : JSON.stringify(event.data);
+  for (const line of payload.split("\n")) {
+    lines.push(`data: ${line}`);
+  }
+
+  return `${lines.join("\n")}\n\n`;
+}
+
 function sendOpenAIError(res, statusCode, message) {
   const type =
     statusCode === 401
@@ -1094,6 +1431,11 @@ function classifyErrorStatus(error) {
     message.includes("messages") ||
     message.includes("缺少 role") ||
     message.includes("content") ||
+    message.includes("routes") ||
+    message.includes("publicBaseUrl") ||
+    message.includes("requestTimeoutMs") ||
+    message.includes("管理配置") ||
+    message.includes("必须是") ||
     message.includes("暂不支持") ||
     message.includes("不是对象")
   ) {
@@ -1152,18 +1494,66 @@ function pickRoute(routes, requestedModel) {
 }
 
 function loadConfig() {
-  const port = parseInteger(process.env.PORT, 8787);
-  const publicBaseUrl = requiredEnv("PUBLIC_BASE_URL");
-  const requestTimeoutMs = parseInteger(process.env.REQUEST_TIMEOUT_MS, 120000);
+  const baseConfig = loadBaseConfig();
+  const managedConfig = readManagedConfigFile(baseConfig.admin.configPath);
+  return mergeManagedConfig(baseConfig, managedConfig);
+}
 
+function loadBaseConfig() {
   return {
-    port,
-    publicBaseUrl,
+    port: parseInteger(process.env.PORT, 8787),
+    publicBaseUrl: process.env.PUBLIC_BASE_URL?.trim() || "",
     bridgeApiKey: process.env.BRIDGE_API_KEY?.trim() || "",
     callbackToken: process.env.LINDY_CALLBACK_TOKEN?.trim() || "",
-    requestTimeoutMs,
-    routes: loadRoutes(),
+    requestTimeoutMs: parseInteger(process.env.REQUEST_TIMEOUT_MS, 120000),
+    routes: loadEnvRoutes(),
+    admin: {
+      configPath: resolve(process.cwd(), process.env.BRIDGE_CONFIG_PATH?.trim() || DEFAULT_MANAGED_CONFIG_PATH),
+      explicitToken: process.env.ADMIN_TOKEN?.trim() || "",
+      token: "",
+      authSource: "loopback_only",
+      managedConfigExists: false,
+    },
   };
+}
+
+function mergeManagedConfig(baseConfig, managedConfig) {
+  const nextConfig = {
+    ...baseConfig,
+    routes: { ...baseConfig.routes },
+    admin: {
+      ...baseConfig.admin,
+      managedConfigExists: Boolean(managedConfig),
+    },
+  };
+
+  if (managedConfig) {
+    if (Object.prototype.hasOwnProperty.call(managedConfig, "publicBaseUrl")) {
+      nextConfig.publicBaseUrl = normalizeRequiredString("publicBaseUrl", managedConfig.publicBaseUrl);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(managedConfig, "bridgeApiKey")) {
+      nextConfig.bridgeApiKey = normalizeOptionalString("bridgeApiKey", managedConfig.bridgeApiKey);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(managedConfig, "callbackToken")) {
+      nextConfig.callbackToken = normalizeOptionalString("callbackToken", managedConfig.callbackToken);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(managedConfig, "requestTimeoutMs")) {
+      nextConfig.requestTimeoutMs = normalizePositiveInteger("requestTimeoutMs", managedConfig.requestTimeoutMs);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(managedConfig, "adminToken")) {
+      nextConfig.admin.explicitToken = normalizeOptionalString("adminToken", managedConfig.adminToken);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(managedConfig, "routes")) {
+      nextConfig.routes = normalizeManagedRoutes(managedConfig.routes);
+    }
+  }
+
+  return finalizeRuntimeConfig(nextConfig);
 }
 
 function loadEnvFiles() {
@@ -1212,7 +1602,7 @@ function applyEnvText(content) {
   }
 }
 
-function loadRoutes() {
+function loadEnvRoutes() {
   if (process.env.LINDY_ROUTES?.trim()) {
     let parsed;
     try {
@@ -1221,16 +1611,17 @@ function loadRoutes() {
       throw new Error(`LINDY_ROUTES 不是合法 JSON: ${error instanceof Error ? error.message : "未知错误"}`);
     }
 
-    const routes = {};
-    for (const [name, value] of Object.entries(parsed)) {
-      routes[name] = normalizeRoute(name, value);
-    }
-    return routes;
+    return normalizeRouteRecord("LINDY_ROUTES", parsed);
+  }
+
+  const webhookUrl = process.env.LINDY_WEBHOOK_URL?.trim() || "";
+  if (!webhookUrl) {
+    return {};
   }
 
   return {
     default: normalizeRoute("default", {
-      webhookUrl: requiredEnv("LINDY_WEBHOOK_URL"),
+      webhookUrl,
       webhookSecret: process.env.LINDY_WEBHOOK_SECRET?.trim() || "",
     }),
   };
@@ -1266,12 +1657,176 @@ function parseRouteTimeout(value) {
   return null;
 }
 
-function requiredEnv(name) {
-  const value = process.env[name]?.trim();
-  if (!value) {
-    throw new Error(`缺少环境变量 ${name}`);
+function normalizeManagedConfigInput(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("管理配置请求体必须是 JSON 对象");
   }
-  return value;
+
+  return {
+    version: 1,
+    publicBaseUrl: normalizeRequiredString("publicBaseUrl", payload.publicBaseUrl),
+    bridgeApiKey: normalizeOptionalString("bridgeApiKey", payload.bridgeApiKey),
+    callbackToken: normalizeOptionalString("callbackToken", payload.callbackToken),
+    requestTimeoutMs: normalizePositiveInteger("requestTimeoutMs", payload.requestTimeoutMs),
+    adminToken: normalizeOptionalString("adminToken", payload.adminToken),
+    routes: routesToArray(normalizeManagedRoutes(payload.routes)),
+  };
+}
+
+function readManagedConfigFile(configPath) {
+  if (!existsSync(configPath)) {
+    return null;
+  }
+
+  const text = readFileSync(configPath, "utf8").trim();
+  if (!text) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("根节点必须是对象");
+    }
+    return parsed;
+  } catch (error) {
+    throw new Error(`管理配置文件解析失败: ${error instanceof Error ? error.message : "未知错误"}`);
+  }
+}
+
+function writeManagedConfigFile(configPath, managedConfig) {
+  writeFileSync(configPath, `${JSON.stringify(managedConfig, null, 2)}\n`, "utf8");
+}
+
+function finalizeRuntimeConfig(runtimeConfig) {
+  if (!runtimeConfig.publicBaseUrl) {
+    throw new Error("缺少 PUBLIC_BASE_URL 或管理配置中的 publicBaseUrl");
+  }
+
+  if (!runtimeConfig.requestTimeoutMs || runtimeConfig.requestTimeoutMs < 1) {
+    throw new Error("REQUEST_TIMEOUT_MS / requestTimeoutMs 必须是正整数");
+  }
+
+  if (!runtimeConfig.routes || Object.keys(runtimeConfig.routes).length === 0) {
+    throw new Error("缺少 Lindy webhook 配置，请设置 LINDY_WEBHOOK_URL / LINDY_ROUTES，或在管理页面保存 routes");
+  }
+
+  const explicitToken = runtimeConfig.admin.explicitToken.trim();
+  const fallbackToken = runtimeConfig.bridgeApiKey;
+  const authSource = explicitToken ? "admin_token" : fallbackToken ? "bridge_api_key" : "loopback_only";
+
+  return {
+    ...runtimeConfig,
+    admin: {
+      ...runtimeConfig.admin,
+      explicitToken,
+      token: explicitToken || fallbackToken,
+      authSource,
+    },
+  };
+}
+
+function normalizeRouteRecord(fieldName, value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${fieldName} 必须是对象`);
+  }
+
+  const routes = {};
+  for (const [name, routeValue] of Object.entries(value)) {
+    routes[name] = normalizeRoute(name, routeValue);
+  }
+
+  if (Object.keys(routes).length === 0) {
+    throw new Error(`${fieldName} 至少需要一个路由`);
+  }
+
+  return routes;
+}
+
+function normalizeManagedRoutes(value) {
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      throw new Error("routes 至少需要一个路由");
+    }
+
+    const routes = {};
+    for (const [index, item] of value.entries()) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        throw new Error(`routes[${index}] 必须是对象`);
+      }
+
+      const model = normalizeRequiredString(`routes[${index}].model`, item.model ?? item.name);
+      if (routes[model]) {
+        throw new Error(`routes 中存在重复模型名: ${model}`);
+      }
+
+      routes[model] = normalizeRoute(model, {
+        webhookUrl: item.webhookUrl,
+        webhookSecret: item.webhookSecret,
+        timeoutMs: normalizeNullablePositiveInteger(`routes[${index}].timeoutMs`, item.timeoutMs),
+      });
+    }
+
+    return routes;
+  }
+
+  return normalizeRouteRecord("routes", value);
+}
+
+function routesToArray(routes) {
+  return Object.values(routes)
+    .sort((left, right) => {
+      if (left.name === "default" && right.name !== "default") {
+        return -1;
+      }
+      if (left.name !== "default" && right.name === "default") {
+        return 1;
+      }
+      return left.name.localeCompare(right.name, "zh-Hans-CN");
+    })
+    .map((route) => ({
+      model: route.name,
+      webhookUrl: route.webhookUrl,
+      webhookSecret: route.webhookSecret,
+      timeoutMs: route.timeoutMs,
+    }));
+}
+
+function normalizeRequiredString(fieldName, value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`${fieldName} 必须是非空字符串`);
+  }
+
+  return value.trim();
+}
+
+function normalizeOptionalString(fieldName, value) {
+  if (value == null) {
+    return "";
+  }
+
+  if (typeof value !== "string") {
+    throw new Error(`${fieldName} 必须是字符串`);
+  }
+
+  return value.trim();
+}
+
+function normalizePositiveInteger(fieldName, value) {
+  const parsed = parseInteger(value, NaN);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new Error(`${fieldName} 必须是正整数`);
+  }
+
+  return parsed;
+}
+
+function normalizeNullablePositiveInteger(fieldName, value) {
+  if (value == null || value === "") {
+    return null;
+  }
+
+  return normalizePositiveInteger(fieldName, value);
 }
 
 function parseInteger(rawValue, fallback) {

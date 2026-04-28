@@ -183,12 +183,12 @@ Lindy 主动提供一个现成的 OpenAI 兼容地址给你
 - 文本对话
 - OpenAI 风格 `chat.completions`
 - Anthropic 风格 `messages`
+- `stream=true` 的伪流式兼容（等待完整结果后一次性按 SSE 格式返回）
 - 单 webhook 固定模型
 - 多 webhook 按 `model` 名路由
 
 ### 不支持
 
-- `stream=true`
 - 工具调用 / function calling
 - 图片、音频、多模态输入
 - 严格还原官方 token 计量
@@ -279,6 +279,7 @@ Lindy 能从公网访问到你的桥接服务
 
 ```env
 PORT=8787
+BRIDGE_CONFIG_PATH=bridge.config.json
 PUBLIC_BASE_URL=https://your-public-bridge.example.com
 LINDY_WEBHOOK_URL=https://public.lindy.ai/api/v1/webhooks/your-webhook-id
 LINDY_WEBHOOK_SECRET=your-lindy-webhook-secret
@@ -288,6 +289,7 @@ LINDY_WEBHOOK_SECRET=your-lindy-webhook-secret
 
 ```env
 BRIDGE_API_KEY=your-local-api-key
+ADMIN_TOKEN=your-admin-token
 LINDY_CALLBACK_TOKEN=your-callback-token
 REQUEST_TIMEOUT_MS=120000
 ```
@@ -320,6 +322,18 @@ PUBLIC_BASE_URL=https://bridge.example.com
 
 如果你本机跑服务，但还没做公网映射，这里先不要填 `127.0.0.1`，那样 Lindy 访问不到。
 
+#### `BRIDGE_CONFIG_PATH`
+
+可选。
+
+用于指定可视化管理页面保存配置文件的位置。
+
+默认：
+
+```env
+BRIDGE_CONFIG_PATH=bridge.config.json
+```
+
 #### `LINDY_WEBHOOK_URL`
 
 这是你在 Lindy 里创建 `Webhook Received` 之后，Lindy 给你的那个地址。
@@ -351,6 +365,17 @@ BRIDGE_API_KEY=my-bridge-key
 
 以后你的客户端调用桥接服务时，也要带这个 key。
 
+#### `ADMIN_TOKEN`
+
+可选。
+
+用于单独保护管理页面的配置 API。
+
+如果你不设置它：
+
+- 但设置了 `BRIDGE_API_KEY`，管理 API 会复用 `BRIDGE_API_KEY`
+- 两者都没设置时，管理 API 只允许本机访问
+
 #### `LINDY_CALLBACK_TOKEN`
 
 可选，但强烈建议设置。
@@ -379,6 +404,26 @@ BRIDGE_API_KEY=my-bridge-key
 ```bash
 node server.mjs
 ```
+
+### 4. 打开可视化管理页面
+
+服务启动后，可以直接访问：
+
+```text
+http://127.0.0.1:8787/__admin
+```
+
+它可以做这些事：
+
+- 管理 `PUBLIC_BASE_URL`、`BRIDGE_API_KEY`、`LINDY_CALLBACK_TOKEN`、`REQUEST_TIMEOUT_MS`
+- 可视化维护多个 webhook 与模型名的映射
+- 保存到 `bridge.config.json`，并在不重启进程的情况下让新请求立即生效
+
+如果你已经有 `.env` 配置，也没问题：
+
+- 启动时先读 `.env` / `.env.local`
+- 如果存在 `bridge.config.json`，则用它覆盖同名配置
+- 所以你可以先用 `.env` 起服务，再逐步迁移到管理页面
 
 服务会自动读取当前目录下的：
 
@@ -564,7 +609,7 @@ Create new task
     { "role": "user", "text": "你好" },
     { "role": "assistant", "text": "你好，请说。" }
   ],
-  "prompt": "桥接层整理好的完整对话文本",
+  "prompt": "桥接层整理好的完整对话文本（不含 system）",
   "lastUserMessage": "最后一条用户消息",
   "temperature": 0.2,
   "maxTokens": 512,
@@ -641,7 +686,7 @@ Create new task
 
 为什么不是自己再拼一遍 `messages`？
 
-因为桥接层已经替你把完整历史整理成了 `prompt` 文本。
+因为桥接层已经替你把完整历史整理成了 `prompt` 文本，而且默认不再重复包含 `system`。
 
 #### `Temperature`
 
@@ -1185,7 +1230,7 @@ POST /__lindy/prepare?token=你的 LINDY_CALLBACK_TOKEN
 ```json
 {
   "system": "字符串形式的 system",
-  "prompt": "字符串形式的 prompt",
+  "prompt": "字符串形式的 prompt（不含 system）",
   "lastUserMessage": "最后一条用户消息",
   "jobId": "uuid",
   "callbackUrl": "https://your-bridge.example.com/__lindy/callback/uuid?token=xxx",
@@ -1221,6 +1266,11 @@ Webhook Received
 - 如果你只能拿到原始 JSON 字符串，就用 `text/plain` 发过去
 
 如果原始 body 里已经有 `prompt` / `system`，它会直接返回；如果只有 `messages`，它也会自动重建 prompt。
+
+默认建议你在 `LLM Call` 里使用：
+
+- `System Prompt` -> `system`
+- `User Prompt` -> `prompt`
 
 ### 对你当前这种 UI 限制，推荐工作流
 
